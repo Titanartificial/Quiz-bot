@@ -18,11 +18,13 @@ A local screen-reading and auto-clicking quiz helper built with Python, Ollama (
 2. `[model]` downscale + ask `qwen2.5vl:3b` for JSON `{question, choices, answer_label, next}` (same prompt/options as before; robust JSON extraction added)
 3. `[pick]` map the model's answer back onto one of its own choices
 4. `[locate]` Tesseract OCR finds that choice on screen — fast 1-pass mode, then thorough 4-pass mode (upscale / threshold / inverted-chroma) with duplicate-line dedupe only if needed
-5. `[click]` click the option, then poll-retry hunting the Next button (it renders late)
+5. `[click]` click the option, then hunt the Next button with retries — it only renders AFTER the answer registers, so the search never trusts the model's (often empty) pre-answer label: it always also tries `NEXT_LABELS`, accepts fuzzy substring hits on short text ("Correct! Next"), and widens to a dedicated bottom-strip OCR pass on later attempts
 6. `[time]` per-stage timing summary so you can see what is slow
 
 ## Debugging
-Every run appends timestamped detail to `quizbot.log` (set `LOG_FILE = None` to disable), including a full config dump at startup, the raw model reply snippet when JSON parsing fails, candidate OCR lines when a choice can't be located, and short top-of-screen text when the Next button can't be found. The module docstring in `QUIZ-BOT.py` contains a cheat-sheet mapping each log tag to its likely cause and the CONFIG knob to tweak (`BOX_OFFSET_X`, `NEXT_LABELS`, `CHOICE_LEN_FACTOR/SLACK`, `MAX_MARKER_EXTRA_CHARS`, `NEXT_TRIES/DELAY`).
+Every run appends timestamped detail to `quizbot.log` (set `LOG_FILE = None` to disable), including a full config dump at startup, the raw model reply snippet when JSON parsing fails, candidate OCR lines when a choice can't be located, and short text near BOTH the top and bottom of the screen when the Next button can't be found. The module docstring in `QUIZ-BOT.py` contains a cheat-sheet mapping each log tag to its likely cause and the CONFIG knob to tweak (`BOX_OFFSET_X`, `NEXT_LABELS`, `CHOICE_LEN_FACTOR/SLACK`, `MAX_MARKER_EXTRA_CHARS`, `NEXT_TRIES/DELAY`, `NEXT_STRIP_TOP`, `MAX_BUTTON_CHARS`).
+
+**Next-button failures (the most common bug):** many quiz apps hide the Next/Submit button until you answer, and when it appears its text differs from what the model saw ("Correct! Next", "Great job, continue!", or an empty label). The hunter now handles this with three layers: fuzzy substring matching on short button-like text, always-on `NEXT_LABELS` fallbacks regardless of what the model reported, and a cropped bottom-strip OCR pass (all 4 pre-processing passes, including inverted-chroma for white-on-blue buttons) on later retry attempts. If it still gives up, the log shows every short phrase near the top AND bottom of the screen so you can copy the real button word into `NEXT_LABELS`.
 
 ## Robustness notes
 - Model output wrapped in ``` fences or stray prose no longer crashes the run

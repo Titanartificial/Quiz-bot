@@ -34,9 +34,13 @@ DEBUGGING CHEAT-SHEET
 * "[locate] not found (fast)"   -> normal; it automatically retries in thorough
                                    mode. Only a real failure if thorough also fails.
 * "[locate] marker hit but wrong spot" -> tune BOX_OFFSET_X.
-* "[next] gave up"              -> prints short OCR lines near the top of the
-                                   screen so you can see what the button actually
-                                   says; add that word to NEXT_LABELS.
+* "[next] gave up"              -> prints short OCR lines near BOTH the top and
+                                   bottom of the screen so you can see what the
+                                   button actually says; add that word to
+                                   NEXT_LABELS. (Buttons revealed only AFTER
+                                   answering are handled by fuzzy substring
+                                   matching + a dedicated bottom-strip OCR pass;
+                                   tune NEXT_STRIP_TOP if yours sits higher.)
 * Everything is also appended to quizbot.log with timestamps + a full config dump
   at startup, so you can diff two runs.
 
@@ -70,6 +74,8 @@ DRY_RUN = False             # True = print coordinates instead of clicking.
 IMG_WIDTH = 768             # screenshot width sent to the model (smaller = faster).
 NEXT_TRIES = 4              # attempts to find the Next button (it appears late).
 NEXT_DELAY = 0.8            # seconds between Next-button retry screenshots.
+NEXT_STRIP_TOP = 0.7        # bottom-strip OCR fallback starts at this height fraction;
+                            # revealed (post-answer) buttons live below it.
 CLICK_SETTLE = 0.5          # pause after ticking an answer, before hunting Next.
 LOG_FILE = "quizbot.log"    # set to None to disable file logging.
 
@@ -77,6 +83,8 @@ LOG_FILE = "quizbot.log"    # set to None to disable file logging.
 MAX_MARKER_EXTRA_CHARS = 1  # "A)" cleans to "a" + ")" -> allow 1 stray char.
 CHOICE_LEN_FACTOR = 2       # OCR line may be at most factor * choice length...
 CHOICE_LEN_SLACK = 6        # ...plus this many chars of slack (length cap).
+MAX_BUTTON_CHARS = 20       # max cleaned length for a fuzzy Next-button match;
+                            # longer text is prose/feedback, not a button label.
 
 if platform.system() == "Windows":
     pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -121,7 +129,8 @@ def dump_config():
     cfg = {
         "MODEL": MODEL, "BOX_OFFSET_X": BOX_OFFSET_X, "NEXT_LABELS": NEXT_LABELS,
         "DRY_RUN": DRY_RUN, "IMG_WIDTH": IMG_WIDTH, "NEXT_TRIES": NEXT_TRIES,
-        "NEXT_DELAY": NEXT_DELAY, "CLICK_SETTLE": CLICK_SETTLE,
+        "NEXT_DELAY": NEXT_DELAY, "NEXT_STRIP_TOP": NEXT_STRIP_TOP,
+        "CLICK_SETTLE": CLICK_SETTLE, "MAX_BUTTON_CHARS": MAX_BUTTON_CHARS,
         "tesseract_cmd": pytesseract.pytesseract.tesseract_cmd,
         "python": sys.version.split()[0], "platform": platform.system(),
     }
@@ -345,6 +354,23 @@ def ocr_lines(img, monitor, thorough=False):
     return lines
 
 
+def _bottom_strip_lines(img, monitor):
+    """OCR just the bottom strip of the screen (thorough passes).
+
+    Used by click_next as a widening fallback: buttons that only appear AFTER
+    an answer is ticked slide in at the bottom of these apps and are easy to
+    miss in a full-screen pass (small text, coloured background). Cropping
+    means fewer competing words and lets us run ALL pre-processing passes
+    cheaply on a small region — including the inverted-chroma pass that
+    catches white "NEXT" text on a blue/green button.
+    """
+    h = img.height
+    strip_img = img.crop((0, int(h * NEXT_STRIP_TOP), img.width, h))
+    # Shift coordinates back into full-screen space so clicks land correctly.
+    strip_monitor = dict(monitor, top=monitor["top"] + int(h * NEXT_STRIP_TOP))
+    return ocr_lines(strip_img, strip_monitor, thorough=True)
+
+
 # ---------------------------------------------------------------------------
 # STAGE 3 — CHOICE MATCHING (model answer -> one of the model's choices)
 # ---------------------------------------------------------------------------
@@ -436,6 +462,14 @@ def find_next_spot(lines, next_label):
          a WHOLE LINE whose cleaned text equals it.
       2. failing that, a single WORD inside any line equal to it, because OCR
          often merges the button with nearby text ("A Correct! NEXT").
+      3. last resort, SUBSTRING match on short lines/words (<= MAX_BUTTON_CHARS).
+         This catches the most common failure mode: when you answer, the app
+         REPLACES the button's text with feedback and the real label is buried
+         inside it ("Next Question" -> "Correct! Next", "Continue to next" ->
+         "Great job, continue!"). Strict equality can never match those, so we
+         accept any SHORT line that contains a wanted word, preferring the
+         shortest one (least noise). Long sentences are excluded so prose like
+         "Click next to see the explanation" in the question area can't win.
     Returns (x, y) or None.
     """
     wanted = [clean(w) for w in [next_label] + NEXT_LABELS if w]
@@ -450,6 +484,25 @@ def find_next_spot(lines, next_label):
             for word in line["words"]:
                 if clean(word["text"]) == w:
                     return center(word)
+
+    # Strategy 3: fuzzy substring on short candidates only. Collect hits from
+    # whole lines first, then individual words; min-by-length = closest to a
+    # pure button label.
+    fuzzy = []
+    for w in wanted:
+        for line in lines:
+            c = clean(line["text"])
+            if w and w in c and len(c) <= MAX_BUTTON_CHARS:
+                fuzzy.append((len(c), center(line)))
+        for line in lines:
+            for word in line["words"]:
+                c = clean(word["text"])
+                if w and w in c and len(c) <= MAX_BUTTON_CHARS:
+                    fuzzy.append((len(c), center(word)))
+    if fuzzy:
+        spot = min(fuzzy)[1]
+        log.debug("[next] matched via fuzzy substring fallback")
+        return spot
     return None
 
 
@@ -465,17 +518,32 @@ def click(x, y, desc):
 def click_next(next_label):
     """The Next button only renders AFTER our tick registers, so poll-retry:
     each attempt takes a fresh screenshot, tries fast OCR, then thorough OCR.
-    Waits NEXT_DELAY between attempts. On final failure, dumps short OCR lines
-    from the top third of the screen (where headers/buttons usually live) so
-    you can see what the button actually says and extend NEXT_LABELS.
+    Waits NEXT_DELAY between attempts.
+
+    Post-answer layout awareness (the most common failure mode fixed here):
+    many quiz apps HIDE the Next/Submit button until an answer is selected, and
+    when it appears its text often differs from what the model saw on the
+    pre-answer screenshot (empty string, or merged with feedback like
+    "Correct! Next"). So we never trust the first label alone — every attempt
+    also searches the NEXT_LABELS fallbacks, and later attempts widen the scan
+    to the bottom strip of the screen too (revealed buttons typically slide in
+    at the bottom-right). On final failure, dumps short OCR lines from both
+    thirds of the screen so you can see what the button actually says and
+    extend NEXT_LABELS.
     """
     last_lines, monitor = [], None
     for attempt in range(NEXT_TRIES):
         img, monitor = grab_screen()
+        # Later attempts = button is definitely rendered by now; if the top
+        # region still has no hit, widen to the bottom strip where revealed
+        # navigation buttons live.
         spot = find_next_spot(ocr_lines(img, monitor), next_label)
         if not spot:
             last_lines = ocr_lines(img, monitor, thorough=True)
             spot = find_next_spot(last_lines, next_label)
+        if not spot and attempt >= NEXT_TRIES // 2:
+            bottom = _bottom_strip_lines(img, monitor)
+            spot = find_next_spot(bottom, next_label)
         if spot:
             click(*spot, "Next")
             return True
@@ -483,9 +551,12 @@ def click_next(next_label):
         if attempt < NEXT_TRIES - 1:
             time.sleep(NEXT_DELAY)
 
-    top = monitor["top"] + monitor["height"] // 3 if monitor else 0
-    seen = [l["text"] for l in last_lines if l["top"] < top and len(l["text"]) <= 25]
-    log.warning(f"[next] gave up. Short OCR text near top of screen: {seen}")
+    third = monitor["height"] // 3 if monitor else 0
+    top = monitor["top"] + third if monitor else 0
+    bot = monitor["top"] + monitor["height"] - third if monitor else 0
+    seen = [l["text"] for l in last_lines
+            if (l["top"] < top or l["top"] >= bot) and len(l["text"]) <= 25]
+    log.warning(f"[next] gave up. Short OCR text near top AND bottom of screen: {seen}")
     log.warning("[next] Click Next manually. If the button says something else, "
                 "add that word to NEXT_LABELS.")
     return False
