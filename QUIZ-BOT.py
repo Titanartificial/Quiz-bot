@@ -4,102 +4,168 @@ QUIZ-BOT — local screen-reading quiz solver.
 HOW THE PIPELINE WORKS (read this before bugfixing!)
 ====================================================
 
-Each hotkey press runs one full "solve cycle". The cycle has 6 stages, and every
-stage prints a [tag] so you can tell exactly where things went wrong:
+Each hotkey press (or --test <image> run) executes one solve cycle across
+6 logged stages so you can pinpoint accuracy or UI bugs immediately:
 
-  [grab]   Stage 1 — Screenshot the primary monitor with mss (fast, raw pixels).
-  [model]  Stage 2 — Downscale the image and ask the vision model (Ollama) to
-                     extract {question, choices, answer_label, next} as JSON.
-                     The MODEL IS UNCHANGED: same model name, same prompt, same
-                     sampling options (temperature 0, num_predict 400, keep_alive).
-  [pick]   Stage 3 — Match the model's answer_label back to one of its own
-                     choices (labels first, then text). Fuzzy matching rules are
-                     documented in find_chosen().
-  [locate] Stage 4 — Tesseract OCR finds WHERE that choice is on the real screen.
-                     Two passes: fast (1 grayscale pass), then thorough (4 passes)
-                     only if the fast pass fails. See ocr_lines() for why each
-                     pre-processing pass exists. Matching rules documented in
-                     find_choice_spot().
-  [click]  Stage 5 — pyautogui clicks the found coordinate (or prints it in dry
-                     run mode). Then click_next() hunts for the Next button with
-                     retries, because it only appears after the tick registers.
-  [time]   Stage 6 — Per-stage timing summary so you can see what is slow.
+  [grab]    Stage 1 — Screenshot the primary monitor with mss (or load image
+                      in --test mode).
+  [ocr]     Stage 2 — Fast 1-pass Tesseract OCR runs BEFORE the model call.
+                      Its layout-grouped text is optionally fed to the model as
+                      a spelling/symbol helper (USE_OCR_HINT) and reused in
+                      Stage 5 at zero extra cost.
+  [model]   Stage 3 — Downscale to IMG_WIDTH (1280px) and ask the vision model
+                      (Ollama, MODEL unchanged) for structured JSON containing:
+                      subject, topic, context, question, choices, reasoning,
+                      answer_label, answer_text, confidence, next.
+                      If confidence is not "high" or label/text disagree, an
+                      optional verification pass (VERIFY_UNCERTAIN) re-checks
+                      negations, numbers, code, and distractors.
+  [pick]    Stage 4 — Cross-check answer_label AND answer_text against the
+                      extracted choices, flagging any disagreement and
+                      recovering from label slips when answer_text matches.
+  [locate]  Stage 5 — Find the chosen choice on screen (reusing Stage 2 fast
+                      OCR first, falling back to 4-pass thorough OCR if needed).
+  [click]   Stage 6 — Click the choice (or log in DRY_RUN), wait CLICK_SETTLE,
+                      then hunt for the Next button with retries + bottom-strip
+                      fallback.
+  [debug]   Artifact — Saves model_input.png, annotated.png (click crosshairs +
+                      OCR boxes), and trace.json into debug_runs/ (auto-pruned).
 
-DEBUGGING CHEAT-SHEET
-=====================
-* "[model] ... no JSON object"  -> model returned prose instead of JSON; the raw
-                                   reply snippet is dumped to the log & console.
-* "[pick] no match"             -> model's answer_label doesn't correspond to any
-                                   choice it listed; both are printed.
-* "[locate] not found (fast)"   -> normal; it automatically retries in thorough
-                                   mode. Only a real failure if thorough also fails.
-* "[locate] marker hit but wrong spot" -> tune BOX_OFFSET_X.
-* "[next] gave up"              -> prints short OCR lines near BOTH the top and
-                                   bottom of the screen so you can see what the
-                                   button actually says; add that word to
-                                   NEXT_LABELS. (Buttons revealed only AFTER
-                                   answering are handled by fuzzy substring
-                                   matching + a dedicated bottom-strip OCR pass;
-                                   tune NEXT_STRIP_TOP if yours sits higher.)
-* Everything is also appended to quizbot.log with timestamps + a full config dump
-  at startup, so you can diff two runs.
+BUGHUNTING CHEAT-SHEET
+======================
+* Run offline on any screenshot without touching your mouse:
+    python QUIZ-BOT.py --test debug_runs/<run>/model_input.png
+* "[model] ... no JSON object"    -> raw reply dumped to quizbot.log & trace.json.
+                                     Raise MODEL_NUM_PREDICT if truncated.
+* Model misread small text/math   -> open model_input.png in debug_runs/ to see
+                                     what the model saw; raise IMG_WIDTH or
+                                     keep USE_OCR_HINT = True.
+* Model picked wrong answer       -> read [context] + [reason] + [verify] in
+                                     quizbot.log or trace.json to see whether
+                                     the flaw was OCR/reading or reasoning.
+* "[pick] ... mismatch"           -> answer_label and answer_text pointed to
+                                     different choices; details are logged.
+* "[locate] marker hit wrong spot"-> open annotated.png in debug_runs/ and tune
+                                     BOX_OFFSET_X.
+* "[next] gave up"                -> inspect short top/bottom OCR lines logged
+                                     and add the real button word to NEXT_LABELS.
 
 Dependencies: mss, pytesseract (+Tesseract binary), pyautogui, Pillow, pynput,
-ollama (with MODEL pulled). No changes to the model itself.
+ollama (with MODEL pulled). MODEL itself is unchanged.
 """
 
+import argparse
+from datetime import datetime
 import io
 import json
 import logging
-import sys
+from pathlib import Path
 import platform
+import re
+import shutil
+import sys
 import threading
 import time
+import traceback
 
 import mss
-import pytesseract
-import pyautogui
-from PIL import Image, ImageChops, ImageOps
-from pynput import keyboard
 import ollama
+from PIL import Image, ImageChops, ImageDraw, ImageOps
+import pyautogui
+from pynput import keyboard
+import pytesseract
 
 # ---------------------------------------------------------------------------
-# CONFIG — everything tunable lives here
+# CONFIG — everything tunable lives here (MODEL stays identical)
 # ---------------------------------------------------------------------------
 
-MODEL = "qwen2.5vl:3b"      # exact same model as before — do not treat as tunable
-BOX_OFFSET_X = 40           # px from a lone marker like "A" to the tickbox right of it.
-NEXT_LABELS = ["Next", "Continue", "Submit", "Finish", "Done"]  # fallback button words
-DRY_RUN = False             # True = print coordinates instead of clicking.
-IMG_WIDTH = 768             # screenshot width sent to the model (smaller = faster).
-NEXT_TRIES = 4              # attempts to find the Next button (it appears late).
-NEXT_DELAY = 0.8            # seconds between Next-button retry screenshots.
-NEXT_STRIP_TOP = 0.7        # bottom-strip OCR fallback starts at this height fraction;
-                            # revealed (post-answer) buttons live below it.
-CLICK_SETTLE = 0.5          # pause after ticking an answer, before hunting Next.
-LOG_FILE = "quizbot.log"    # set to None to disable file logging.
+MODEL = "qwen2.5vl:3b"      # exact same model as before — do not change
+MODEL_NUM_CTX = 4096        # enough room for 1280px image tokens + OCR + reasoning
+MODEL_NUM_PREDICT = 1024    # generous token budget so reasoning + JSON never truncate
+IMG_WIDTH = 1280            # screenshot width sent to the model (sharper = better reading)
+USE_OCR_HINT = True         # pass layout-grouped full-res OCR text to help small-text reading
+OCR_HINT_MAX_CHARS = 2500   # cap OCR helper text so prompt stays focused and fast
+VERIFY_UNCERTAIN = True     # run a second-pass self-check when confidence != "high" or mismatched
 
-# Tunables for the OCR matching heuristics (see find_choice_spot):
-MAX_MARKER_EXTRA_CHARS = 1  # "A)" cleans to "a" + ")" -> allow 1 stray char.
+BOX_OFFSET_X = 40           # px from a lone marker like "A" to the tickbox right of it
+NEXT_LABELS = ["Next", "Continue", "Submit", "Finish", "Done"]
+DRY_RUN = False             # True = log target coordinates instead of clicking
+NEXT_TRIES = 4              # attempts to find the Next button (may render after answer)
+NEXT_DELAY = 0.8            # seconds between Next-button retry screenshots
+NEXT_STRIP_TOP = 0.7        # bottom-strip OCR fallback starts at this height fraction
+CLICK_SETTLE = 0.5          # pause after ticking an answer, before hunting Next
+
+# Tunables for OCR matching heuristics (see find_choice_spot / find_next_spot):
+MAX_MARKER_EXTRA_CHARS = 1  # allow at most 1 stray OCR char on a marker (e.g. "oA")
 CHOICE_LEN_FACTOR = 2       # OCR line may be at most factor * choice length...
-CHOICE_LEN_SLACK = 6        # ...plus this many chars of slack (length cap).
-MAX_BUTTON_CHARS = 20       # max cleaned length for a fuzzy Next-button match;
-                            # longer text is prose/feedback, not a button label.
+CHOICE_LEN_SLACK = 6        # ...plus this many chars of slack
+MAX_BUTTON_CHARS = 20       # max cleaned length for a fuzzy Next-button match
+
+# Logging & bughunt artifacts:
+LOG_FILE = "quizbot.log"    # set to None to disable file logging
+DEBUG_SAVE_DIR = "debug_runs"
+DEBUG_SAVE_MODE = "always"  # "always" | "on_error" | "off"
+DEBUG_KEEP_LAST = 20        # prune older run folders beyond this count
 
 if platform.system() == "Windows":
     pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-pyautogui.FAILSAFE = True   # slam the mouse into a corner to abort everything.
-pyautogui.PAUSE = 0.05      # tiny gap between every GUI action (stability).
+pyautogui.FAILSAFE = True   # slam the mouse into a corner to abort everything
+pyautogui.PAUSE = 0.05      # tiny gap between every GUI action (stability)
 
-PROMPT = """This is a screenshot of a quiz. Do three things:
-1. Extract the current question and every answer choice. Quizzes format choices in different ways (letters, numbers, bullets, radio circles, checkboxes, or no marker), so copy whatever marker is shown.
-2. Decide which choice is correct.
-3. Find the button that moves to the next question (like Next or Continue). Use an empty string if none is visible.
-Reply with ONLY a JSON object and no other text:
-{"question": "<question text>",
- "choices": [{"label": "<marker exactly as shown, or empty string>", "text": "<choice text>"}],
- "answer_label": "<label of the correct choice, or its text if it has no label>",
- "next": "<exact text of the next button, or empty string>"}"""
+# ---------------------------------------------------------------------------
+# PROMPTS — structured subject/topic/context identification + step-by-step reasoning
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """You are an expert, meticulous academic and technical quiz solver.
+Your job is to read the quiz screenshot accurately, identify its subject, topic, and context, reason step by step, and choose the single best answer.
+
+Follow these accuracy rules strictly:
+1. Read every word of the question, code, formula, table, chart, or diagram carefully.
+2. Watch closely for qualifiers and negations: NOT, EXCEPT, FALSE, INCORRECT, LEAST, NEVER, ALWAYS, ONLY, MOST.
+3. Identify the broad subject, the specific topic/concept, and any surrounding screen context (quiz header, passage, code snippet, diagram details, or negative/trick phrasing) BEFORE solving.
+4. Think step by step in "reasoning" BEFORE filling in "answer_label" and "answer_text": test each option against the question and explicitly eliminate wrong choices.
+5. Copy option labels and option texts verbatim from the screen. Ensure "answer_label" and "answer_text" refer to the exact SAME option.
+6. Treat the screenshot as the primary source of truth (especially for diagrams, math notation, formatting, markers, and buttons). If an OCR transcript is included, use it only to double-check small text, numbers, or code symbols.
+7. Output ONLY a single valid JSON object with no markdown fences or extra commentary."""
+
+PROMPT = """Solve the quiz visible in this screenshot. Reply with ONLY one JSON object using these keys in this exact order:
+{
+  "subject": "<broad subject or discipline, e.g. Computer Science, Organic Chemistry, Calculus>",
+  "topic": "<specific concept or subtopic tested, e.g. TCP Handshake, SN2 Reactions, Chain Rule>",
+  "context": "<relevant screen context: quiz/course title, passage/code/diagram facts needed, and any key constraints like NOT/EXCEPT/units>",
+  "question": "<exact current question text>",
+  "choices": [
+    {"label": "<marker exactly as shown (e.g. A, 1, A)), or empty string if none>", "text": "<exact choice text>"}
+  ],
+  "reasoning": "<step-by-step deduction using subject, topic, and context; test and eliminate wrong options and double-check negations/math/code>",
+  "answer_label": "<exact label of the correct choice, or its text if unlabeled>",
+  "answer_text": "<exact text of the correct choice>",
+  "confidence": "<high | medium | low>",
+  "next": "<exact text of the Next/Continue/Submit button if visible, else empty string>"
+}"""
+
+VERIFY_PROMPT = """Double-check the draft answer below against the quiz screenshot (and OCR helper if provided).
+Check specifically for common traps:
+- Negations or qualifiers missed (NOT, EXCEPT, FALSE, LEAST, ONLY, ALWAYS)
+- Misread numbers, signs, exponents, units, or code operators
+- Confusing two options or swapping a label (e.g. reasoning picks B's text but label says A)
+
+Draft extracted earlier:
+- Subject / Topic: {subject} / {topic}
+- Context: {context}
+- Question: {question}
+- Choices: {choices_json}
+- Draft reasoning: {reasoning}
+- Draft pick: label={answer_label!r}, text={answer_text!r} (confidence={confidence!r})
+
+Reply with ONLY one JSON object:
+{{
+  "checked_trap": "<the key constraint, visual detail, or potential trap you verified>",
+  "reasoning": "<concise verification confirming or correcting the answer>",
+  "answer_label": "<verified label of the correct choice, or its text if unlabeled>",
+  "answer_text": "<verified exact text of the correct choice>",
+  "confidence": "<high | medium | low>"
+}}"""
 
 # ---------------------------------------------------------------------------
 # LOGGING — console + timestamped file so bugs leave a paper trail
@@ -116,25 +182,29 @@ if LOG_FILE:
         _fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
         _fh.setFormatter(_fmt)
         log.addHandler(_fh)
-    except OSError as e:  # read-only folder etc — console logging still works
+    except OSError as e:
         log.warning(f"[init] could not open log file {LOG_FILE!r}: {e}")
 
-# A lock so double-tapping the hotkey can't start two overlapping solves
-# (which would double-click the same question and desync everything).
+# Serializes hotkey presses so double-tapping cannot overlap two solves.
 _solve_lock = threading.Lock()
 
 
 def dump_config():
-    """Log the full runtime config once at startup — useful when comparing runs."""
+    """Log the full runtime config once at startup for comparing runs."""
     cfg = {
-        "MODEL": MODEL, "BOX_OFFSET_X": BOX_OFFSET_X, "NEXT_LABELS": NEXT_LABELS,
-        "DRY_RUN": DRY_RUN, "IMG_WIDTH": IMG_WIDTH, "NEXT_TRIES": NEXT_TRIES,
+        "MODEL": MODEL, "MODEL_NUM_CTX": MODEL_NUM_CTX,
+        "MODEL_NUM_PREDICT": MODEL_NUM_PREDICT, "IMG_WIDTH": IMG_WIDTH,
+        "USE_OCR_HINT": USE_OCR_HINT, "VERIFY_UNCERTAIN": VERIFY_UNCERTAIN,
+        "BOX_OFFSET_X": BOX_OFFSET_X, "NEXT_LABELS": NEXT_LABELS,
+        "DRY_RUN": DRY_RUN, "NEXT_TRIES": NEXT_TRIES,
         "NEXT_DELAY": NEXT_DELAY, "NEXT_STRIP_TOP": NEXT_STRIP_TOP,
         "CLICK_SETTLE": CLICK_SETTLE, "MAX_BUTTON_CHARS": MAX_BUTTON_CHARS,
+        "DEBUG_SAVE_MODE": DEBUG_SAVE_MODE, "DEBUG_SAVE_DIR": DEBUG_SAVE_DIR,
         "tesseract_cmd": pytesseract.pytesseract.tesseract_cmd,
         "python": sys.version.split()[0], "platform": platform.system(),
     }
     log.debug(f"[init] config: {json.dumps(cfg)}")
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -142,90 +212,20 @@ def dump_config():
 # ---------------------------------------------------------------------------
 
 def grab_screen():
-    """Grab the primary monitor. Returns (PIL RGB image, monitor dict).
-
-    monitor holds the real-screen origin (left/top) + size, needed to convert
-    OCR pixel offsets into absolute click coordinates. mss is much faster than
-    pyautogui.screenshot; it returns BGRA bytes which we reinterpret directly
-    ("BGRX" raw mode swaps R/B so the colours come out correct — keep it).
-    """
+    """Grab the primary monitor. Returns (PIL RGB image, monitor dict)."""
     with mss.mss() as sct:
-        monitor = sct.monitors[1]  # index 0 is the whole virtual desktop; 1 = primary
+        monitor = sct.monitors[1]  # index 0 = virtual desktop; 1 = primary
         shot = sct.grab(monitor)
         img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
     return img, monitor
 
 
 # ---------------------------------------------------------------------------
-# STAGE 2 — VISION MODEL QUERY  (model + prompt identical to the original)
-# ---------------------------------------------------------------------------
-
-def parse_model_json(raw):
-    """Extract the JSON object from the model's reply.
-
-    We asked for format="json", so normally this is a straight json.loads.
-    But small models occasionally wrap output in ``` fences or add chatter,
-    and the old code crashed with a bare json.JSONDecodeError. Strategy:
-      1. try json.loads on the whole string;
-      2. else slice out the outermost {...} braces and try again;
-      3. else raise ValueError including a snippet of the raw reply so the
-         log tells you WHAT the model actually said.
-    """
-    raw = (raw or "").strip()
-    candidates = [raw]
-    start, end = raw.find("{"), raw.rfind("}")
-    if start != -1 and end > start:
-        candidates.append(raw[start:end + 1])
-    for cand in candidates:
-        try:
-            obj = json.loads(cand)
-            if isinstance(obj, dict):
-                return obj
-        except json.JSONDecodeError:
-            continue
-    raise ValueError(f"no JSON object in model reply; raw starts with: {raw[:200]!r}")
-
-
-def ask_model(img):
-    """Downscale -> PNG bytes -> Ollama chat -> parsed dict. Raises on failure.
-
-    Downsizing to IMG_WIDTH keeps the payload small (big speed win) while
-    staying legible for a vision model. temperature=0 makes replies repeatable,
-    keep_alive=-1 pins the model in RAM/VRAM so later calls skip reload latency.
-    """
-    small = img.resize((IMG_WIDTH, max(1, round(img.height * IMG_WIDTH / img.width))),
-                       Image.LANCZOS)
-    buf = io.BytesIO()
-    small.save(buf, format="PNG")
-    png = buf.getvalue()
-    log.debug(f"[model] sending {small.width}x{small.height} PNG ({len(png) // 1024} KiB)")
-
-    t0 = time.perf_counter()
-    resp = ollama.chat(
-        model=MODEL,
-        messages=[{"role": "user", "content": PROMPT, "images": [png]}],
-        format="json",
-        keep_alive=-1,
-        options={"temperature": 0, "num_predict": 400},
-    )
-    dt = time.perf_counter() - t0
-    raw = resp["message"]["content"]
-    data = parse_model_json(raw)
-    log.debug(f"[model] replied in {dt:.1f}s: {json.dumps(data, ensure_ascii=False)[:400]}")
-    return data
-
-
-# ---------------------------------------------------------------------------
-# TEXT NORMALISATION + SHARED MATCHING HELPERS
+# TEXT NORMALISATION + SHARED HELPERS
 # ---------------------------------------------------------------------------
 
 def clean(s):
-    """Lowercase and keep only letters/digits, so 'A)', 'a.' and 'A' compare equal.
-
-    Unicode-aware by design: accented letters count as alnum (str.isalnum),
-    which matters for non-English quizzes where ASCII-only stripping would
-    silently destroy the text and make every match fail.
-    """
+    """Lowercase and keep only Unicode letters/digits for resilient matching."""
     return "".join(c for c in (s or "") if c.isalnum()).lower()
 
 
@@ -235,23 +235,11 @@ def center(box):
 
 
 # ---------------------------------------------------------------------------
-# STAGE 4 — OCR
+# STAGE 2 / STAGE 5 — OCR
 # ---------------------------------------------------------------------------
 
 def _lines_from(img, monitor, scale):
-    """Run Tesseract word-level data on ONE prepared image.
-
-    Returns line dicts in REAL SCREEN coordinates:
-      {"text", "left", "top", "right", "bottom", "words": [word boxes...]}
-
-    `scale` is how much bigger `img` is than the real screen (1 or 2); we divide
-    coordinates back down and add the monitor origin so results map to pyautogui.
-    Words are grouped into lines by Tesseract's block/para/line numbering.
-    Word boxes are kept because find_next_spot needs single-word matches when
-    OCR merges a button with neighbouring text ("A Correct! NEXT").
-    Tokens with conf <= 0 are Tesseract noise markers and get dropped early —
-    that stops junk words from polluting line text used for matching.
-    """
+    """Run Tesseract word-level OCR on ONE prepared image in real screen coords."""
     data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
 
     def box(i):
@@ -292,45 +280,27 @@ def _lines_from(img, monitor, scale):
 
 
 def dedupe_lines(lines):
-    """Drop duplicate lines produced by overlapping OCR passes.
-
-    Thorough mode runs 4 passes over the same screen; without dedupe, a button
-    found by two passes yields two candidate hits and wastes work. Two lines
-    count as duplicates when their cleaned text matches AND their boxes overlap
-    by >=50% of the smaller area (position matters too: repeated 'A' markers
-    stack vertically and must NOT collapse into one).
-    """
+    """Drop duplicate lines produced by overlapping OCR passes."""
     kept = []
-    for l in lines:
+    for line in lines:
         dup = False
-        lw = max(1, (l["right"] - l["left"]) * (l["bottom"] - l["top"]))
+        lw = max(1, (line["right"] - line["left"]) * (line["bottom"] - line["top"]))
         for k in kept:
-            if clean(k["text"]) != clean(l["text"]):
+            if clean(k["text"]) != clean(line["text"]):
                 continue
-            ox = max(0, min(k["right"], l["right"]) - max(k["left"], l["left"]))
-            oy = max(0, min(k["bottom"], l["bottom"]) - max(k["top"], l["top"]))
+            ox = max(0, min(k["right"], line["right"]) - max(k["left"], line["left"]))
+            oy = max(0, min(k["bottom"], line["bottom"]) - max(k["top"], line["top"]))
             kw = max(1, (k["right"] - k["left"]) * (k["bottom"] - k["top"]))
             if ox * oy >= 0.5 * min(kw, lw):
                 dup = True
                 break
         if not dup:
-            kept.append(l)
+            kept.append(line)
     return kept
 
 
 def ocr_lines(img, monitor, thorough=False):
-    """OCR the screen. Fast mode = 1 pass; thorough = 4 passes + dedupe.
-
-    Why each extra pass exists (this is the usual culprit when [locate] fails):
-      * plain grayscale ......... baseline; catches normal-sized dark-on-light UI
-      * 2x upscale .............. small fonts under ~12px fall below Tesseract's
-                                  accuracy floor; upscaling fixes them
-      * thresholded bright bg ... crisp dark text on white (buttons like "NEXT")
-      * inverted chroma ......... LIGHT text on coloured buttons: take the darkest
-                                  channel per pixel (coloured bg -> mid, white
-                                  text -> high), threshold + invert so the text
-                                  becomes black-on-white for Tesseract.
-    """
+    """OCR the screen. Fast mode = 1 pass; thorough = 4 passes + dedupe."""
     plain = ImageOps.grayscale(img)
     lines = _lines_from(plain, monitor, 1)
     if not thorough:
@@ -354,199 +324,351 @@ def ocr_lines(img, monitor, thorough=False):
     return lines
 
 
-def _bottom_strip_lines(img, monitor):
-    """OCR just the bottom strip of the screen (thorough passes).
+def format_ocr_hint(lines, max_chars=OCR_HINT_MAX_CHARS):
+    """Group OCR lines by visual row so markers stay paired with their choice text."""
+    if not lines:
+        return ""
+    ordered = sorted(lines, key=lambda l: ((l["top"] + l["bottom"]) // 2, l["left"]))
+    rows = []
+    for line in ordered:
+        ymid = (line["top"] + line["bottom"]) // 2
+        if rows and abs(ymid - rows[-1][0]) <= 10:
+            rows[-1][1].append(line)
+        else:
+            rows.append([ymid, [line]])
 
-    Used by click_next as a widening fallback: buttons that only appear AFTER
-    an answer is ticked slide in at the bottom of these apps and are easy to
-    miss in a full-screen pass (small text, coloured background). Cropping
-    means fewer competing words and lets us run ALL pre-processing passes
-    cheaply on a small region — including the inverted-chroma pass that
-    catches white "NEXT" text on a blue/green button.
-    """
+    formatted = []
+    for _, row_lines in rows:
+        row_lines.sort(key=lambda l: l["left"])
+        joined = " | ".join(l["text"].strip() for l in row_lines if l["text"].strip())
+        if joined:
+            formatted.append(joined)
+
+    transcript = "\n".join(formatted)
+    if len(transcript) > max_chars:
+        transcript = transcript[:max_chars].rstrip() + "\n[...OCR truncated...]"
+    return transcript
+
+
+def _bottom_strip_lines(img, monitor):
+    """OCR just the bottom strip of the screen (all 4 thorough passes)."""
     h = img.height
     strip_img = img.crop((0, int(h * NEXT_STRIP_TOP), img.width, h))
-    # Shift coordinates back into full-screen space so clicks land correctly.
     strip_monitor = dict(monitor, top=monitor["top"] + int(h * NEXT_STRIP_TOP))
     return ocr_lines(strip_img, strip_monitor, thorough=True)
 
 
 # ---------------------------------------------------------------------------
-# STAGE 3 — CHOICE MATCHING (model answer -> one of the model's choices)
+# STAGE 3 — VISION MODEL QUERY & VERIFICATION
 # ---------------------------------------------------------------------------
 
-def find_chosen(choices, pick):
-    """Map the model's answer_label onto one of its own choices.
+def parse_model_json(raw):
+    """Extract the JSON object from the model's reply, tolerating stray chatter."""
+    raw = (raw or "").strip()
+    candidates = [raw]
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(raw[start:end + 1])
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            continue
+    raise ValueError(f"no JSON object in model reply; raw starts with: {raw[:240]!r}")
 
-    Rules, in priority order (same semantics as the original, now documented):
-      1. exact cleaned-label match   ("A)" vs "a" -> equal after clean())
-      2. exact cleaned-text match    (model echoed the full choice text)
-      3. substring text match        (model answered a shortened version)
-    Returns the choice dict or None. Empty/whitespace picks never match, so a
-    hallucinated "" answer cannot accidentally click option 0.
-    """
-    p = clean(pick)
-    if not p:
+
+def prepare_model_image(img):
+    """Downscale screenshot to IMG_WIDTH (or keep if already smaller) and encode PNG."""
+    target_w = min(img.width, IMG_WIDTH)
+    if target_w < img.width:
+        target_h = max(1, round(img.height * target_w / img.width))
+        prepared = img.resize((target_w, target_h), Image.LANCZOS)
+    else:
+        prepared = img
+    buf = io.BytesIO()
+    prepared.save(buf, format="PNG")
+    return prepared, buf.getvalue()
+
+
+def _call_ollama_json(user_prompt, png, ocr_hint="", tag="model"):
+    """Send a structured prompt + image to Ollama and return (parsed_dict, raw_text, dt)."""
+    content = user_prompt
+    if ocr_hint:
+        content += (
+            "\n\nFull-resolution OCR transcript (helper only — trust the screenshot "
+            "for layout, diagrams, math symbols, and button labels):\n"
+            f"```\n{ocr_hint}\n```"
+        )
+
+    t0 = time.perf_counter()
+    resp = ollama.chat(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": content, "images": [png]},
+        ],
+        format="json",
+        keep_alive=-1,
+        options={
+            "temperature": 0,
+            "num_ctx": MODEL_NUM_CTX,
+            "num_predict": MODEL_NUM_PREDICT,
+        },
+    )
+    dt = time.perf_counter() - t0
+    raw = resp["message"]["content"]
+    data = parse_model_json(raw)
+    log.debug(f"[{tag}] replied in {dt:.2f}s ({len(raw)} chars)")
+    return data, raw, dt
+
+
+def ask_model(png, ocr_hint=""):
+    """Primary solve query on the vision model."""
+    return _call_ollama_json(PROMPT, png, ocr_hint=ocr_hint, tag="model")
+
+
+def verify_model_answer(png, draft, ocr_hint=""):
+    """Second-pass self-verification for uncertain or self-contradictory answers."""
+    prompt = VERIFY_PROMPT.format(
+        subject=draft.get("subject", ""),
+        topic=draft.get("topic", ""),
+        context=draft.get("context", ""),
+        question=draft.get("question", ""),
+        choices_json=json.dumps(draft.get("choices", []), ensure_ascii=False),
+        reasoning=draft.get("reasoning", ""),
+        answer_label=draft.get("answer_label", ""),
+        answer_text=draft.get("answer_text", ""),
+        confidence=draft.get("confidence", ""),
+    )
+    return _call_ollama_json(prompt, png, ocr_hint=ocr_hint, tag="verify")
+
+
+# ---------------------------------------------------------------------------
+# STAGE 4 — CHOICE MATCHING & CROSS-CHECKING
+# ---------------------------------------------------------------------------
+
+_LABEL_PREFIX_RE = re.compile(r"^(?:option|choice|answer)\s*[:.\-)]?\s*", re.IGNORECASE)
+
+
+def _strip_label_prefix(s):
+    return _LABEL_PREFIX_RE.sub("", (s or "").strip())
+
+
+def _match_by_label(choices, answer_label):
+    """Return index of choice matching answer_label, or None."""
+    raw = (answer_label or "").strip()
+    if not raw:
         return None
-    for c in choices:
-        if clean(c.get("label", "")) == p:
-            return c
-    for c in choices:
-        ct = clean(c.get("text", ""))
-        if ct and (p == ct or p in ct):
-            return c
+    targets = [clean(raw), clean(_strip_label_prefix(raw))]
+    targets = [t for t in targets if t]
+
+    for target in targets:
+        for idx, c in enumerate(choices):
+            lbl = clean(c.get("label", ""))
+            if lbl and lbl == target:
+                return idx
+
+    # Handle e.g. answer_label="B) Paris" when choice label is "B"
+    for idx, c in enumerate(choices):
+        lbl = (c.get("label", "") or "").strip()
+        clbl = clean(lbl)
+        if not clbl:
+            continue
+        for cand in (raw, _strip_label_prefix(raw)):
+            ccand = clean(cand)
+            if ccand.startswith(clbl) and len(cand) > len(lbl):
+                sep = cand[len(lbl):len(lbl) + 1]
+                if sep and not sep.isalnum():
+                    return idx
     return None
 
 
+def _match_by_text(choices, answer_text):
+    """Return index of choice matching answer_text (exact first, then best substring)."""
+    target = clean(answer_text)
+    if not target:
+        return None
+
+    for idx, c in enumerate(choices):
+        ct = clean(c.get("text", ""))
+        if ct and ct == target:
+            return idx
+
+    # Substring fallback (prefer closest length so "5" doesn't overshadow "50")
+    candidates = []
+    for idx, c in enumerate(choices):
+        ct = clean(c.get("text", ""))
+        if not ct:
+            continue
+        if (len(target) >= 2 and target in ct) or (len(ct) >= 2 and ct in target):
+            candidates.append((abs(len(ct) - len(target)), idx))
+    if candidates:
+        return min(candidates)[1]
+    return None
+
+
+def find_chosen(choices, answer_label, answer_text=""):
+    """Resolve the model's answer onto one of its extracted choices.
+
+    Returns a dict:
+      {"choice": dict | None, "index": int | None, "method": str, "mismatch": bool}
+    Cross-checks answer_label against answer_text so label slips are caught
+    and logged loudly for bughunting.
+    """
+    if not choices:
+        return {"choice": None, "index": None, "method": "no-choices", "mismatch": False}
+
+    idx_lbl = _match_by_label(choices, answer_label)
+    idx_txt = _match_by_text(choices, answer_text)
+
+    if idx_lbl is not None and idx_txt is not None:
+        if idx_lbl == idx_txt:
+            return {"choice": choices[idx_lbl], "index": idx_lbl,
+                    "method": "label+text", "mismatch": False}
+        # Prefer answer_text on disagreement: small VLMs slip a letter more often
+        # than they hallucinate the full wording of a different option.
+        log.warning(
+            f"[pick] MISMATCH: answer_label={answer_label!r} -> choice[{idx_lbl}] "
+            f"({choices[idx_lbl].get('text')!r}), but answer_text={answer_text!r} -> "
+            f"choice[{idx_txt}] ({choices[idx_txt].get('text')!r}); preferring text match"
+        )
+        return {"choice": choices[idx_txt], "index": idx_txt,
+                "method": "mismatch-prefer-text", "mismatch": True}
+
+    if idx_lbl is not None:
+        if (answer_text or "").strip():
+            log.debug(f"[pick] matched by label only (answer_text {answer_text!r} did not match)")
+        return {"choice": choices[idx_lbl], "index": idx_lbl,
+                "method": "label-only", "mismatch": False}
+
+    if idx_txt is not None:
+        log.info(f"[pick] recovered via answer_text (answer_label {answer_label!r} missed)")
+        return {"choice": choices[idx_txt], "index": idx_txt,
+                "method": "text-recovery", "mismatch": False}
+
+    # Unlabeled fallback: model may have put the option text inside answer_label.
+    idx_fallback = _match_by_text(choices, answer_label)
+    if idx_fallback is not None:
+        return {"choice": choices[idx_fallback], "index": idx_fallback,
+                "method": "label-as-text", "mismatch": False}
+
+    return {"choice": None, "index": None, "method": "unmatched", "mismatch": False}
+
+
 # ---------------------------------------------------------------------------
-# STAGE 4b — SPOTTING THE CHOICE ON SCREEN
+# STAGE 5b — SPOTTING THE CHOICE ON SCREEN
 # ---------------------------------------------------------------------------
 
 def find_choice_spot(lines, choice, question):
-    """Return (x, y) to click for this choice, or None. Two strategies:
-
-    A) MARKER STRATEGY — there is an OCR line that is just the marker ("A", "1",
-       "A)"). Click BOX_OFFSET_X px to the RIGHT of the marker's box, vertically
-       centred on that line — that's where radio buttons/tickboxes sit.
-       If several lines match the marker (e.g. stray OCR hits of a bare letter),
-       prefer the LOWEST one: answer lists run top-to-bottom, and spurious
-       single-letter detections usually come from elsewhere on the page.
-    B) TEXT STRATEGY — no usable marker line. Find a SHORT line containing the
-       choice text. The length cap (factor + slack, see CONFIG) stops us from
-       clicking the question paragraph when it happens to quote an option;
-       lines whose text is part of the question are excluded outright. Among
-       hits, the SHORTEST line wins (least likely to be a sentence that merely
-       contains the phrase). Click its centre.
-    On failure, logs the candidate OCR lines so you can see WHY nothing matched.
-    """
+    """Return ((x, y), strategy, matched_line) or (None, None, None)."""
     qc = clean(question)
     label = clean(choice.get("label", ""))
     text = clean(choice.get("text", ""))
 
     if label:
-        max_len = len(label) + MAX_MARKER_EXTRA_CHARS
-        markers = [l for l in lines
-                   if clean(l["text"]) == label
-                   or (clean(l["text"]).startswith(label)
-                       and len(clean(l["text"])) <= max_len)]
-        if markers:
-            row = max(markers, key=lambda l: l["top"])
+        exact_markers = [l for l in lines if clean(l["text"]) == label]
+        if not exact_markers:
+            max_len = len(label) + MAX_MARKER_EXTRA_CHARS
+            exact_markers = [
+                l for l in lines
+                if clean(l["text"]).startswith(label) and len(clean(l["text"])) <= max_len
+            ]
+        if exact_markers:
+            row = max(exact_markers, key=lambda l: l["top"])
             y = (row["top"] + row["bottom"]) // 2
             x = row["right"] + BOX_OFFSET_X
             log.debug(f"[locate] marker strategy: line {row['text']!r} -> ({x},{y})")
-            return x, y
+            return (x, y), "marker", row
 
     if text:
         limit = len(text) * CHOICE_LEN_FACTOR + CHOICE_LEN_SLACK
-        hits = [l for l in lines
-                if text in clean(l["text"])
-                and clean(l["text"]) not in qc
-                and len(clean(l["text"])) <= limit]
+        hits = [
+            l for l in lines
+            if text in clean(l["text"])
+            and clean(l["text"]) not in qc
+            and len(clean(l["text"])) <= limit
+        ]
         if hits:
-            best = min(hits, key=lambda l: len(clean(l["text"])))
-            log.debug(f"[locate] text strategy: {len(hits)} hits, chose {best['text']!r}")
-            return center(best)
+            # Prefer exact text match (with or without label), then shortest line.
+            best = min(
+                hits,
+                key=lambda l: (
+                    0 if clean(l["text"]) in (text, label + text) else 1,
+                    len(clean(l["text"])),
+                ),
+            )
+            spot = center(best)
+            log.debug(f"[locate] text strategy: {len(hits)} hits, chose {best['text']!r} -> {spot}")
+            return spot, "text", best
 
     log.debug(f"[locate] no OCR line matched label={label!r} text={text!r}; "
               f"first 20 OCR lines were {[l['text'] for l in lines][:20]}")
-    return None
+    return None, None, None
 
 
 # ---------------------------------------------------------------------------
-# STAGE 5 — FINDING + CLICKING
+# STAGE 6 — FINDING + CLICKING
 # ---------------------------------------------------------------------------
 
 def find_next_spot(lines, next_label):
-    """Locate the Next button. Checks in priority order:
-      1. the model-reported label, then the NEXT_LABELS fallbacks —
-         a WHOLE LINE whose cleaned text equals it.
-      2. failing that, a single WORD inside any line equal to it, because OCR
-         often merges the button with nearby text ("A Correct! NEXT").
-      3. last resort, SUBSTRING match on short lines/words (<= MAX_BUTTON_CHARS).
-         This catches the most common failure mode: when you answer, the app
-         REPLACES the button's text with feedback and the real label is buried
-         inside it ("Next Question" -> "Correct! Next", "Continue to next" ->
-         "Great job, continue!"). Strict equality can never match those, so we
-         accept any SHORT line that contains a wanted word, preferring the
-         shortest one (least noise). Long sentences are excluded so prose like
-         "Click next to see the explanation" in the question area can't win.
-    Returns (x, y) or None.
-    """
-    wanted = [clean(w) for w in [next_label] + NEXT_LABELS if w]
+    """Locate the Next button. Returns ((x, y), match_kind, matched_text) or (None, None, None)."""
+    wanted = [clean(w) for w in [next_label] + NEXT_LABELS if clean(w)]
 
     for w in wanted:
         for line in lines:
             if clean(line["text"]) == w:
-                return center(line)
+                return center(line), "exact-line", line["text"]
 
     for w in wanted:
         for line in lines:
             for word in line["words"]:
                 if clean(word["text"]) == w:
-                    return center(word)
+                    return center(word), "exact-word", word["text"]
 
-    # Strategy 3: fuzzy substring on short candidates only. Collect hits from
-    # whole lines first, then individual words; min-by-length = closest to a
-    # pure button label.
     fuzzy = []
     for w in wanted:
         for line in lines:
             c = clean(line["text"])
-            if w and w in c and len(c) <= MAX_BUTTON_CHARS:
-                fuzzy.append((len(c), center(line)))
+            if w in c and len(c) <= MAX_BUTTON_CHARS:
+                fuzzy.append((len(c), center(line), "fuzzy-line", line["text"]))
         for line in lines:
             for word in line["words"]:
                 c = clean(word["text"])
-                if w and w in c and len(c) <= MAX_BUTTON_CHARS:
-                    fuzzy.append((len(c), center(word)))
+                if w in c and len(c) <= MAX_BUTTON_CHARS:
+                    fuzzy.append((len(c), center(word), "fuzzy-word", word["text"]))
     if fuzzy:
-        spot = min(fuzzy)[1]
-        log.debug("[next] matched via fuzzy substring fallback")
-        return spot
-    return None
+        _, spot, kind, mtext = min(fuzzy)
+        return spot, kind, mtext
+    return None, None, None
 
 
-def click(x, y, desc):
-    """Click via pyautogui, or just report the coordinate in DRY_RUN mode."""
-    if DRY_RUN:
+def click(x, y, desc, dry_run=DRY_RUN):
+    """Click via pyautogui, or log the coordinate in dry-run mode."""
+    if dry_run:
         log.info(f"[dry run] would click {desc} at {(x, y)}")
     else:
         pyautogui.click(x, y)
         log.info(f"[click] clicked {desc} at {(x, y)}")
 
 
-def click_next(next_label):
-    """The Next button only renders AFTER our tick registers, so poll-retry:
-    each attempt takes a fresh screenshot, tries fast OCR, then thorough OCR.
-    Waits NEXT_DELAY between attempts.
-
-    Post-answer layout awareness (the most common failure mode fixed here):
-    many quiz apps HIDE the Next/Submit button until an answer is selected, and
-    when it appears its text often differs from what the model saw on the
-    pre-answer screenshot (empty string, or merged with feedback like
-    "Correct! Next"). So we never trust the first label alone — every attempt
-    also searches the NEXT_LABELS fallbacks, and later attempts widen the scan
-    to the bottom strip of the screen too (revealed buttons typically slide in
-    at the bottom-right). On final failure, dumps short OCR lines from both
-    thirds of the screen so you can see what the button actually says and
-    extend NEXT_LABELS.
-    """
+def click_next(next_label, dry_run=DRY_RUN):
+    """Poll-retry finding and clicking the Next/Submit button after answering."""
     last_lines, monitor = [], None
     for attempt in range(NEXT_TRIES):
         img, monitor = grab_screen()
-        # Later attempts = button is definitely rendered by now; if the top
-        # region still has no hit, widen to the bottom strip where revealed
-        # navigation buttons live.
-        spot = find_next_spot(ocr_lines(img, monitor), next_label)
+        spot, kind, mtext = find_next_spot(ocr_lines(img, monitor), next_label)
         if not spot:
             last_lines = ocr_lines(img, monitor, thorough=True)
-            spot = find_next_spot(last_lines, next_label)
+            spot, kind, mtext = find_next_spot(last_lines, next_label)
         if not spot and attempt >= NEXT_TRIES // 2:
             bottom = _bottom_strip_lines(img, monitor)
-            spot = find_next_spot(bottom, next_label)
+            spot, kind, mtext = find_next_spot(bottom, next_label)
         if spot:
-            click(*spot, "Next")
-            return True
+            log.debug(f"[next] attempt {attempt + 1}/{NEXT_TRIES} matched {kind} ({mtext!r}) -> {spot}")
+            click(*spot, "Next", dry_run=dry_run)
+            return {"ok": True, "spot": spot, "kind": kind, "text": mtext, "attempt": attempt + 1}
         log.debug(f"[next] attempt {attempt + 1}/{NEXT_TRIES}: button not found yet")
         if attempt < NEXT_TRIES - 1:
             time.sleep(NEXT_DELAY)
@@ -559,103 +681,352 @@ def click_next(next_label):
     log.warning(f"[next] gave up. Short OCR text near top AND bottom of screen: {seen}")
     log.warning("[next] Click Next manually. If the button says something else, "
                 "add that word to NEXT_LABELS.")
-    return False
+    return {"ok": False, "spot": None, "kind": None, "text": None, "seen_edges": seen}
 
 
 # ---------------------------------------------------------------------------
-# STAGE 6 — FULL SOLVE CYCLE
+# BUGHUNT ARTIFACTS — save annotated screenshot + full JSON trace
 # ---------------------------------------------------------------------------
 
-def solve_one():
-    """One question: grab -> model -> pick -> locate -> click -> next.
+def _prune_debug_runs(base_dir):
+    """Keep only the most recent DEBUG_KEEP_LAST run folders."""
+    if DEBUG_KEEP_LAST <= 0 or not base_dir.exists():
+        return
+    runs = sorted(
+        (p for p in base_dir.iterdir() if p.is_dir() and p.name.startswith("run_")),
+        key=lambda p: p.name,
+    )
+    for old in runs[:-DEBUG_KEEP_LAST]:
+        shutil.rmtree(old, ignore_errors=True)
 
-    Every stage times itself; the [time] summary line tells you where the
-    seconds go. Any exception is caught and logged WITH traceback so the
-    hotkey listener survives and you get a stack trace in quizbot.log.
-    """
-    t_total = time.perf_counter()
+
+def _draw_crosshair(draw, x, y, color, label, radius=14):
+    """Draw a high-visibility target crosshair + label on the annotated image."""
+    draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=color, width=3)
+    draw.line((x - radius - 8, y, x + radius + 8, y), fill=color, width=2)
+    draw.line((x, y - radius - 8, x, y + radius + 8), fill=color, width=2)
+    draw.text((x + radius + 6, y - 8), label, fill=color)
+
+
+def _save_debug_bundle(trace, full_img, model_img, monitor, ocr_sample_lines,
+                       choice_spot, choice_box, next_spot):
+    """Write model_input.png, annotated.png, and trace.json for post-mortem bughunting."""
+    mode = (DEBUG_SAVE_MODE or "off").lower()
+    if mode == "off":
+        return None
+    if mode == "on_error" and not trace.get("error") and trace.get("pick", {}).get("index") is not None:
+        return None
+
+    base_dir = Path(DEBUG_SAVE_DIR)
+    stamp = datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")[:-3]
+    run_dir = base_dir / stamp
     try:
-        img, monitor = grab_screen()
-        t_grab = time.perf_counter()
-        log.debug(f"[grab] {img.width}x{img.height} monitor@({monitor['left']},"
-                  f"{monitor['top']}) in {(t_grab - t_total) * 1000:.0f} ms")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        if model_img is not None:
+            model_img.save(run_dir / "model_input.png")
 
-        data = ask_model(img)
-        t_model = time.perf_counter()
+        if full_img is not None:
+            annotated = full_img.copy()
+            draw = ImageDraw.Draw(annotated)
+            ox = monitor["left"] if monitor else 0
+            oy = monitor["top"] if monitor else 0
 
-        question = data.get("question", "")
+            for line in (ocr_sample_lines or [])[:120]:
+                draw.rectangle(
+                    (line["left"] - ox, line["top"] - oy, line["right"] - ox, line["bottom"] - oy),
+                    outline=(255, 215, 0), width=1,
+                )
+            if choice_box:
+                draw.rectangle(
+                    (choice_box["left"] - ox, choice_box["top"] - oy,
+                     choice_box["right"] - ox, choice_box["bottom"] - oy),
+                    outline=(0, 220, 100), width=3,
+                )
+            if choice_spot:
+                _draw_crosshair(draw, choice_spot[0] - ox, choice_spot[1] - oy,
+                                (0, 220, 100), f"CHOICE {choice_spot}")
+            if next_spot:
+                _draw_crosshair(draw, next_spot[0] - ox, next_spot[1] - oy,
+                                (0, 160, 255), f"NEXT {next_spot}")
+            annotated.save(run_dir / "annotated.png")
+
+        (run_dir / "trace.json").write_text(
+            json.dumps(trace, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        _prune_debug_runs(base_dir)
+        log.debug(f"[debug] saved run bundle -> {run_dir}")
+        return str(run_dir)
+    except Exception as e:
+        log.warning(f"[debug] failed to save debug bundle: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# STAGE 7 — FULL SOLVE CYCLE (live screen or offline --test image)
+# ---------------------------------------------------------------------------
+
+def _log_model_understanding(data):
+    """Print subject, topic, context, parsed question/choices, and reasoning."""
+    subject = data.get("subject", "") or "-"
+    topic = data.get("topic", "") or "-"
+    context = data.get("context", "") or "-"
+    confidence = data.get("confidence", "") or "-"
+    log.info(f"[context] Subject: {subject} | Topic: {topic} | Confidence: {confidence}")
+    log.info(f"[context] Screen context: {context}")
+    log.info(f"[parse] Q: {data.get('question', '')}")
+    for c in data.get("choices", []):
+        if isinstance(c, dict):
+            log.info(f"[parse]   {c.get('label') or '-'}: {c.get('text')}")
+    log.info(f"[reason] {data.get('reasoning', '')}")
+
+
+def _maybe_verify(png, data, pick_res, ocr_hint, allow_verify, trace):
+    """Run a targeted self-check when confidence is low/medium or label/text disagreed."""
+    if not (allow_verify and VERIFY_UNCERTAIN):
+        return data, pick_res
+    conf = str(data.get("confidence", "")).strip().lower()
+    if conf == "high" and not pick_res["mismatch"]:
+        return data, pick_res
+
+    reason = "label/text mismatch" if pick_res["mismatch"] else f"confidence={conf or 'unknown'!r}"
+    log.info(f"[verify] running second-pass check ({reason})...")
+    v_data, v_raw, v_dt = verify_model_answer(png, data, ocr_hint=ocr_hint)
+    trace["verify"] = {"raw": v_raw, "parsed": v_data, "seconds": round(v_dt, 3)}
+    log.info(f"[verify] trap checked: {v_data.get('checked_trap', '')}")
+    log.info(f"[verify] reasoning: {v_data.get('reasoning', '')}")
+
+    v_pick = find_chosen(
+        data.get("choices", []),
+        v_data.get("answer_label", ""),
+        v_data.get("answer_text", ""),
+    )
+    if v_pick["choice"] is not None:
+        merged = dict(data)
+        for key in ("reasoning", "answer_label", "answer_text", "confidence"):
+            if v_data.get(key):
+                merged[key] = v_data[key]
+        return merged, v_pick
+    log.warning("[verify] verification answer did not match choices; keeping primary pick")
+    return data, pick_res
+
+
+def solve_image(img, monitor, dry_run=DRY_RUN, allow_verify=True, static_image=False):
+    """Run one complete solve cycle on `img` (live capture or offline --test image)."""
+    t_total = time.perf_counter()
+    trace = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "dry_run": dry_run,
+        "static_image": static_image,
+        "monitor": monitor,
+    }
+    model_img = None
+    ocr_fast = []
+    choice_spot = None
+    choice_box = None
+    next_spot = None
+
+    try:
+        t_ocr0 = time.perf_counter()
+        ocr_fast = ocr_lines(img, monitor)
+        t_ocr_fast = time.perf_counter() - t_ocr0
+        ocr_hint = format_ocr_hint(ocr_fast) if USE_OCR_HINT else ""
+
+        model_img, png = prepare_model_image(img)
+        log.debug(
+            f"[model] sending {model_img.width}x{model_img.height} PNG "
+            f"({len(png) // 1024} KiB), ocr_hint={len(ocr_hint)} chars"
+        )
+        data, raw_reply, t_model = ask_model(png, ocr_hint=ocr_hint)
+
+        trace["ocr_hint"] = ocr_hint
+        trace["model"] = {"raw": raw_reply, "parsed": data, "seconds": round(t_model, 3)}
+
         choices = data.get("choices", [])
         if not isinstance(choices, list) or not choices:
+            _log_model_understanding(data)
             log.error("[pick] model returned no choices — cannot answer. "
-                      f"Raw data keys: {list(data)}")
+                      f"Raw keys: {list(data)}")
+            trace["error"] = "no choices returned"
             return
 
-        log.info(f"[parse] Q: {question}")
-        for c in choices:
-            log.info(f"[parse]   {c.get('label') or '-'}: {c.get('text')}")
+        _log_model_understanding(data)
 
-        chosen = find_chosen(choices, data.get("answer_label", ""))
+        pick_res = find_chosen(
+            choices,
+            data.get("answer_label", ""),
+            data.get("answer_text", ""),
+        )
+        data, pick_res = _maybe_verify(png, data, pick_res, ocr_hint, allow_verify, trace)
+        trace["pick"] = {
+            "index": pick_res["index"],
+            "method": pick_res["method"],
+            "mismatch": pick_res["mismatch"],
+            "choice": pick_res["choice"],
+        }
+
+        chosen = pick_res["choice"]
         if not chosen:
-            log.error(f"[pick] model's answer_label {data.get('answer_label', '')!r} "
-                      "matched none of its own choices. Skipping (not guessing).")
+            log.error(
+                f"[pick] answer_label={data.get('answer_label', '')!r}, "
+                f"answer_text={data.get('answer_text', '')!r} matched none of the choices. "
+                "Skipping (not guessing)."
+            )
+            trace["error"] = "pick unmatched"
             return
-        log.info(f"[pick] chose: {chosen.get('label') or chosen.get('text')}")
 
-        lines = ocr_lines(img, monitor)
-        t_fast = time.perf_counter()
-        spot = find_choice_spot(lines, chosen, question)
-        if not spot:
+        log.info(
+            f"[pick] chose [{pick_res['method']}]: "
+            f"{chosen.get('label') or '-'} -> {chosen.get('text')}"
+        )
+
+        t_extra0 = time.perf_counter()
+        choice_spot, strategy, choice_box = find_choice_spot(
+            ocr_fast, chosen, data.get("question", "")
+        )
+        ocr_all = ocr_fast
+        if not choice_spot:
             log.debug("[locate] fast OCR missed, retrying with thorough (4-pass) OCR")
-            lines = ocr_lines(img, monitor, thorough=True)
-            spot = find_choice_spot(lines, chosen, question)
-        t_ocr = time.perf_counter()
-        if not spot:
+            ocr_all = ocr_lines(img, monitor, thorough=True)
+            choice_spot, strategy, choice_box = find_choice_spot(
+                ocr_all, chosen, data.get("question", "")
+            )
+        t_ocr_extra = time.perf_counter() - t_extra0
+        trace["locate"] = {
+            "spot": choice_spot,
+            "strategy": strategy,
+            "matched_text": choice_box["text"] if choice_box else None,
+        }
+
+        if not choice_spot:
             log.error("[locate] could not find the chosen option on screen even after "
-                      "thorough OCR. Check BOX_OFFSET_X / the length caps in CONFIG.")
+                      "thorough OCR. Check BOX_OFFSET_X / CHOICE_LEN_* in CONFIG.")
+            trace["error"] = "locate failed"
             return
-        click(*spot, "choice")
 
-        pyautogui.sleep(CLICK_SETTLE)
-        ok_next = click_next(data.get("next", "") or "Next")
-        t_end = time.perf_counter()
+        click(*choice_spot, "choice", dry_run=dry_run)
 
-        log.info(f"[time] grab {(t_grab - t_total):.2f}s | model {(t_model - t_grab):.2f}s | "
-                 f"ocr-fast {(t_fast - t_model):.2f}s | "
-                 f"ocr-extra {(t_ocr - t_fast):.2f}s | "
-                 f"click+next {(t_end - t_ocr):.2f}s | total {(t_end - t_total):.2f}s | "
-                 f"next={'ok' if ok_next else 'FAILED'}")
+        t_next0 = time.perf_counter()
+        if static_image:
+            # In offline --test mode, inspect the static image once without polling.
+            next_spot, next_kind, next_text = find_next_spot(ocr_all, data.get("next", "") or "Next")
+            if not next_spot:
+                next_spot, next_kind, next_text = find_next_spot(
+                    _bottom_strip_lines(img, monitor), data.get("next", "") or "Next"
+                )
+            next_res = {"ok": bool(next_spot), "spot": next_spot, "kind": next_kind, "text": next_text}
+            if next_spot:
+                log.info(f"[next] (static check) matched {next_kind} ({next_text!r}) -> {next_spot}")
+            else:
+                log.info("[next] (static check) no Next button visible in test image")
+        else:
+            pyautogui.sleep(CLICK_SETTLE)
+            next_res = click_next(data.get("next", "") or "Next", dry_run=dry_run)
+            next_spot = next_res.get("spot")
+        t_next = time.perf_counter() - t_next0
+        trace["next"] = next_res
+
+        t_total_elapsed = time.perf_counter() - t_total
+        trace["timing"] = {
+            "ocr_fast": round(t_ocr_fast, 3),
+            "model": round(t_model, 3),
+            "ocr_extra": round(t_ocr_extra, 3),
+            "click_next": round(t_next, 3),
+            "total": round(t_total_elapsed, 3),
+        }
+        log.info(
+            f"[time] ocr-fast {t_ocr_fast:.2f}s | model {t_model:.2f}s | "
+            f"ocr-extra {t_ocr_extra:.2f}s | click+next {t_next:.2f}s | "
+            f"total {t_total_elapsed:.2f}s | next={'ok' if next_res.get('ok') else 'FAILED'}"
+        )
     except Exception as e:
+        trace["error"] = f"{type(e).__name__}: {e}"
+        trace["traceback"] = traceback.format_exc()
         log.exception(f"[error] solve cycle failed: {e}")
+    finally:
+        _save_debug_bundle(
+            trace, img, model_img, monitor, ocr_fast,
+            choice_spot, choice_box, next_spot,
+        )
 
 
-def _locked_solve():
+def solve_one(dry_run=DRY_RUN, allow_verify=True):
+    """Grab primary screen and run solve_image."""
+    t0 = time.perf_counter()
+    img, monitor = grab_screen()
+    log.debug(
+        f"[grab] {img.width}x{img.height} monitor@({monitor['left']},{monitor['top']}) "
+        f"in {(time.perf_counter() - t0) * 1000:.0f} ms"
+    )
+    solve_image(img, monitor, dry_run=dry_run, allow_verify=allow_verify, static_image=False)
+
+
+def _locked_solve(dry_run, allow_verify):
     """Worker body: run one solve, always release the lock at the end."""
     try:
-        solve_one()
+        solve_one(dry_run=dry_run, allow_verify=allow_verify)
     finally:
         _solve_lock.release()
 
 
-def on_hotkey():
-    """Hotkey callback. Runs the solve in a worker thread so the keyboard
-    listener stays responsive; the non-blocking lock means a second press
-    during an active solve is ignored instead of double-clicking."""
-    if not _solve_lock.acquire(blocking=False):
-        log.warning("[hotkey] a solve is already running — press ignored.")
-        return
-    threading.Thread(target=_locked_solve, daemon=True).start()
-    log.info("[hotkey] starting solve cycle...")
+def make_hotkey_handler(dry_run=DRY_RUN, allow_verify=True):
+    """Build the Ctrl+Alt+Q callback with runtime flags bound."""
+    def on_hotkey():
+        if not _solve_lock.acquire(blocking=False):
+            log.warning("[hotkey] a solve is already running — press ignored.")
+            return
+        threading.Thread(
+            target=_locked_solve, args=(dry_run, allow_verify), daemon=True
+        ).start()
+        log.info("[hotkey] starting solve cycle...")
+    return on_hotkey
 
 
 # ---------------------------------------------------------------------------
 # ENTRY POINT
 # ---------------------------------------------------------------------------
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Local screen-reading quiz solver.")
+    parser.add_argument(
+        "--test", "--replay", dest="test_image", metavar="IMAGE",
+        help="Run once offline on a saved screenshot (implies --dry-run, no clicks).",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Log target coordinates instead of clicking.",
+    )
+    parser.add_argument(
+        "--no-verify", action="store_true",
+        help="Skip the second-pass self-check on low/medium confidence answers.",
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
+    args = parse_args()
+    dry_run = DRY_RUN or args.dry_run or bool(args.test_image)
+    allow_verify = not args.no_verify
     dump_config()
-    mode = "DRY RUN (no clicks)" if DRY_RUN else "LIVE"
+
+    if args.test_image:
+        test_path = Path(args.test_image)
+        if not test_path.is_file():
+            log.error(f"[test] image not found: {test_path}")
+            sys.exit(1)
+        log.info(f"[test] running offline dry-run on {test_path}")
+        with Image.open(test_path) as loaded:
+            rgb_img = loaded.convert("RGB")
+        fake_monitor = {"left": 0, "top": 0, "width": rgb_img.width, "height": rgb_img.height}
+        solve_image(
+            rgb_img, fake_monitor,
+            dry_run=True, allow_verify=allow_verify, static_image=True,
+        )
+        sys.exit(0)
+
+    mode = "DRY RUN (no clicks)" if dry_run else "LIVE"
     log.info(f"Ready in {mode} mode. Click the quiz window, then press Ctrl+Alt+Q.")
     log.info("Slam the mouse into a screen corner to stop (pyautogui failsafe).")
-    log.info(f"Detailed logs -> {LOG_FILE or 'console only'}")
-    with keyboard.GlobalHotKeys({"<ctrl>+<alt>+q": on_hotkey}) as listener:
+    log.info(f"Detailed logs -> {LOG_FILE or 'console only'} | Debug bundles -> {DEBUG_SAVE_DIR}/")
+    handler = make_hotkey_handler(dry_run=dry_run, allow_verify=allow_verify)
+    with keyboard.GlobalHotKeys({"<ctrl>+<alt>+q": handler}) as listener:
         listener.join()
